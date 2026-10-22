@@ -470,4 +470,49 @@ func TestResponse(t *testing.T) {
 		assert.NotEmpty(t, saved["headers"])
 		assert.Contains(t, saved["body"], "foo")
 	})
+
+	t.Run("SaveDefaultPathInTempDir", func(t *testing.T) {
+		v, err := rt.RunString(sr(`
+			var res = http.request("GET", "HTTPBIN_URL/get?foo=bar");
+			[res.save(), res.save()];
+		`))
+		require.NoError(t, err)
+
+		var paths []string
+		require.NoError(t, rt.ExportTo(v, &paths))
+		require.Len(t, paths, 2)
+		assert.NotEqual(t, paths[0], paths[1], "auto-generated file names must be unique")
+		for _, p := range paths {
+			t.Cleanup(func() { _ = os.Remove(p) })
+			assert.Equal(t, filepath.Join(os.TempDir(), savedResponsesDirName), filepath.Dir(p))
+			assert.FileExists(t, p)
+		}
+	})
+
+	t.Run("SaveEmitsMetricWhenFileCannotBeWritten", func(t *testing.T) {
+		notADir := filepath.Join(t.TempDir(), "file")
+		require.NoError(t, os.WriteFile(notADir, []byte("x"), 0o600))
+		metrics.GetBufferedSamples(samples)
+
+		v, err := rt.RunString(sr(fmt.Sprintf(`
+			var res = http.request("GET", "HTTPBIN_URL/get?foo=bar");
+			res.save(%q);
+		`, filepath.Join(notADir, "sub", "saved_response.json"))))
+		require.NoError(t, err, "a failed file write must not throw")
+		assert.Empty(t, v.String())
+
+		var saved []metrics.Sample
+		for _, container := range metrics.GetBufferedSamples(samples) {
+			for _, sample := range container.GetSamples() {
+				if sample.Metric.Name == metrics.HTTPSavedResponsesName {
+					saved = append(saved, sample)
+				}
+			}
+		}
+		require.Len(t, saved, 1)
+		assert.Equal(t, "200", saved[0].Metadata["status"])
+		assert.Contains(t, saved[0].Metadata["response_body"], "foo")
+		assert.NotEmpty(t, saved[0].Metadata["save_error"])
+		assert.NotContains(t, saved[0].Metadata, "saved_file")
+	})
 }

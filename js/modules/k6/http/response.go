@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/grafana/sobek"
@@ -18,6 +19,7 @@ import (
 
 	"go.k6.io/k6/v2/js/common"
 	"go.k6.io/k6/v2/js/modules/k6/html"
+	"go.k6.io/k6/v2/lib"
 	"go.k6.io/k6/v2/lib/netext/httpext"
 	"go.k6.io/k6/v2/metrics"
 )
@@ -276,9 +278,19 @@ func (res *Response) ClickLink(args ...sobek.Value) (*Response, error) {
 	return res.client.Request(http.MethodGet, rt.ToValue(requestURL.String()), sobek.Undefined(), requestParams)
 }
 
+// savedResponsesDirName is the directory created inside os.TempDir() for responses saved without an explicit path.
+const savedResponsesDirName = "k6-saved-responses"
+
+//nolint:gochecknoglobals // shared across VUs so auto-generated file names stay unique within a process
+var savedResponseSeq atomic.Uint64
+
 // Save writes the response URL, status, headers, and body as formatted JSON to the given
-// filePath (or an auto-generated path in ./saved_responses/ if omitted) and emits an
+// filePath (or an auto-generated path in os.TempDir()/k6-saved-responses/ if omitted) and emits an
 // http_saved_responses metric sample containing the response headers and body.
+//
+// The metric is always emitted, so the response still reaches the outputs when the file
+// cannot be written (e.g. on a read-only filesystem). In that case a warning is logged,
+// the metric carries a save_error instead of saved_file, and an empty path is returned.
 func (res *Response) Save(args ...string) (string, error) {
 	now := time.Now()
 	filePath := ""
@@ -286,7 +298,8 @@ func (res *Response) Save(args ...string) (string, error) {
 		filePath = strings.TrimSpace(args[0])
 	}
 	if filePath == "" {
-		filePath = fmt.Sprintf("saved_responses/response-%d-status-%d.json", now.UnixNano(), res.Status)
+		filePath = filepath.Join(os.TempDir(), savedResponsesDirName, fmt.Sprintf(
+			"response-%d-%d-status-%d.json", now.UnixNano(), savedResponseSeq.Add(1), res.Status))
 	}
 
 	var bodyVal any
@@ -323,48 +336,75 @@ func (res *Response) Save(args ...string) (string, error) {
 		return "", err
 	}
 
-	if dir := filepath.Dir(filePath); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return "", err
-		}
+	writeErr := writeSavedResponse(filePath, data)
+	if writeErr != nil {
+		filePath = ""
 	}
 
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		return "", err
-	}
-
-	if res.client != nil && res.client.moduleInstance != nil {
-		if state := res.client.moduleInstance.vu.State(); state != nil &&
-			state.BuiltinMetrics != nil && state.BuiltinMetrics.HTTPSavedResponses != nil {
-			headersJSON, _ := json.Marshal(res.Headers)
-			tagsAndMeta := state.Tags.GetCurrentValues()
-			statusStr := strconv.Itoa(res.Status)
-			tags := tagsAndMeta.Tags.
-				With("url", res.URL).
-				With("status", statusStr)
-
-			meta := maps.Clone(tagsAndMeta.Metadata)
-			if meta == nil {
-				meta = make(map[string]string)
-			}
-			meta["url"] = res.URL
-			meta["status"] = statusStr
-			meta["status_text"] = res.StatusText
-			meta["response_headers"] = string(headersJSON)
-			meta["response_body"] = bodyStr
-			meta["saved_file"] = filePath
-
-			metrics.PushIfNotDone(res.client.moduleInstance.vu.Context(), state.Samples, metrics.Sample{
-				TimeSeries: metrics.TimeSeries{
-					Metric: state.BuiltinMetrics.HTTPSavedResponses,
-					Tags:   tags,
-				},
-				Time:     now,
-				Value:    1,
-				Metadata: meta,
-			})
+	state := res.savedResponseState()
+	if state != nil {
+		res.emitSavedResponseMetric(state, now, bodyStr, filePath, writeErr)
+		if writeErr != nil && state.Logger != nil {
+			state.Logger.WithError(writeErr).WithField("url", res.URL).
+				Warn("Could not write saved response to file, it was only sent as an http_saved_responses metric")
 		}
 	}
 
 	return filePath, nil
+}
+
+func writeSavedResponse(filePath string, data []byte) error {
+	if dir := filepath.Dir(filePath); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(filePath, data, 0o600)
+}
+
+func (res *Response) savedResponseState() *lib.State {
+	if res.client == nil || res.client.moduleInstance == nil {
+		return nil
+	}
+	return res.client.moduleInstance.vu.State()
+}
+
+func (res *Response) emitSavedResponseMetric(
+	state *lib.State, now time.Time, body, savedFile string, writeErr error,
+) {
+	if state.BuiltinMetrics == nil || state.BuiltinMetrics.HTTPSavedResponses == nil {
+		return
+	}
+
+	headersJSON, _ := json.Marshal(res.Headers)
+	tagsAndMeta := state.Tags.GetCurrentValues()
+	statusStr := strconv.Itoa(res.Status)
+	tags := tagsAndMeta.Tags.
+		With("url", res.URL).
+		With("status", statusStr)
+
+	meta := maps.Clone(tagsAndMeta.Metadata)
+	if meta == nil {
+		meta = make(map[string]string)
+	}
+	meta["url"] = res.URL
+	meta["status"] = statusStr
+	meta["status_text"] = res.StatusText
+	meta["response_headers"] = string(headersJSON)
+	meta["response_body"] = body
+	if writeErr != nil {
+		meta["save_error"] = writeErr.Error()
+	} else {
+		meta["saved_file"] = savedFile
+	}
+
+	metrics.PushIfNotDone(res.client.moduleInstance.vu.Context(), state.Samples, metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: state.BuiltinMetrics.HTTPSavedResponses,
+			Tags:   tags,
+		},
+		Time:     now,
+		Value:    1,
+		Metadata: meta,
+	})
 }
